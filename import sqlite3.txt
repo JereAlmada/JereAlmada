@@ -1,0 +1,414 @@
+import sqlite3
+from flask import Flask, jsonify, request
+import pandas as pd # Se añadirá más adelante para la carga de Excel
+from werkzeug.security import generate_password_hash, check_password_hash
+import jwt
+import datetime
+from functools import wraps
+
+# Nombre del archivo de la base de datos
+DATABASE_FILE = 'padron_ciudadano.db'
+
+# Inicializar la aplicación Flask
+app = Flask(__name__)
+
+# Configuración JWT
+app.config['SECRET_KEY'] = 'tu-secreto-temporal-para-desarrollo' # ESTA CLAVE DEBE CAMBIARSE Y PROTEGERSE EN PRODUCCIÓN
+app.config['JWT_ALGORITHM'] = 'HS256'
+app.config['JWT_EXPIRATION_DELTA'] = datetime.timedelta(hours=1)
+
+def get_db_connection():
+    """Crea y retorna una conexión a la base de datos."""
+    conn = sqlite3.connect(DATABASE_FILE)
+    conn.row_factory = sqlite3.Row # Permite acceder a las columnas por nombre
+    return conn
+
+def init_db():
+    """Inicializa la base de datos y crea la tabla Ciudadanos si no existe."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # SQL para crear la tabla Ciudadanos (basado en el diseño acordado)
+    # Se mantienen los nombres de columna similares al Excel como se solicitó.
+    # SQLite es sensible a mayúsculas/minúsculas en nombres de tablas y columnas por defecto,
+    # pero es buena práctica ser consistente. Usaremos minúsculas para los nombres en SQL.
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS ciudadanos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ci TEXT UNIQUE NOT NULL,
+        celular TEXT,
+        apellido TEXT,
+        nombre TEXT,
+        sexo TEXT,
+        direc TEXT,
+        distrito TEXT,
+        distrito_ant TEXT,
+        id_local_vota TEXT,
+        local_votacion TEXT,
+        fec_nac TEXT,
+        dia INTEGER,
+        mes INTEGER,
+        edad INTEGER,
+        seg TEXT,
+        fec_inscrip TEXT,
+        nacionalidad TEXT,
+        partido TEXT,
+        partido_lab TEXT,
+        gral2021 TEXT,
+        gral2023 TEXT,
+        func_publico TEXT,
+        jubilados TEXT,
+        abogados TEXT,
+        tercera_edad TEXT,
+        fecha_carga_registro TEXT DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))
+    )
+    ''')
+    
+    # Crear un índice en la columna 'ci' para búsquedas rápidas
+    cursor.execute('''
+    CREATE INDEX IF NOT EXISTS idx_ci ON ciudadanos (ci)
+    ''')
+
+    # SQL para crear la tabla usuarios_app
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS usuarios_app (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ci_usuario TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL, -- Ej: "administrador", "usuario_consulta"
+        is_active INTEGER NOT NULL DEFAULT 1, -- 1 para true, 0 para false
+        created_at TEXT DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))
+    )
+    ''')
+
+    # Crear un índice en la columna 'ci_usuario' para la tabla 'usuarios_app'
+    cursor.execute('''
+    CREATE INDEX IF NOT EXISTS idx_usuarios_app_ci_usuario ON usuarios_app (ci_usuario)
+    ''')
+    
+    conn.commit()
+    conn.close()
+    print("Base de datos inicializada. Tablas 'ciudadanos' y 'usuarios_app' creadas/verificadas.")
+
+# Ruta de prueba para asegurar que Flask funciona
+@app.route('/')
+def hello():
+    return "¡Hola! El servidor Flask está funcionando."
+
+def cargar_datos_excel(excel_path='padron.xlsx'):
+    """Carga datos desde un archivo Excel a la tabla Ciudadanos."""
+    try:
+        df = pd.read_excel(excel_path)
+
+        # 1. Conversión de Nombres de Columna a minúsculas
+        df.columns = [str(col).lower() for col in df.columns]
+
+        # 2. Tipado de `ci` a str
+        if 'ci' in df.columns:
+            df['ci'] = df['ci'].astype(str)
+        else:
+            print("Error: La columna 'ci' no se encontró en el archivo Excel.")
+            return False
+
+        # 3. Limpieza de Datos (Ejemplo: func_publico a mayúsculas)
+        if 'func_publico' in df.columns:
+            try:
+                # Asegurarse que es string antes de .str.upper() y manejar NaNs
+                df['func_publico'] = df['func_publico'].astype(str).str.upper()
+                # Si después de convertir a str y upper, quedan 'NAN' o similares (por NaNs originales),
+                # podríamos querer reemplazarlos por None o un string vacío si es apropiado.
+                # df['func_publico'] = df['func_publico'].replace({'NAN': None, 'NAT': None})
+            except Exception as e:
+                print(f"Advertencia: No se pudo convertir la columna 'func_publico' a mayúsculas. Error: {e}")
+        else:
+            print("Advertencia: Columna 'func_publico' no encontrada en el Excel. Se omitirá la limpieza.")
+            
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # 4. Inserción Individual con INSERT OR IGNORE
+        # Obtener nombres de columna de la tabla para asegurar que coincidan
+        # Esto es más robusto si el Excel tiene columnas extra que no están en la tabla
+        cursor.execute("PRAGMA table_info(ciudadanos)")
+        table_columns_info = cursor.fetchall()
+        db_column_names = [col_info['name'] for col_info in table_columns_info]
+        
+        # Filtrar columnas del DataFrame para que solo incluyan las que existen en la tabla
+        df_insert_columns = [col for col in df.columns if col in db_column_names]
+
+        if not df_insert_columns:
+            print("Error: Ninguna de las columnas del Excel coincide con las columnas de la tabla 'ciudadanos'.")
+            conn.close()
+            return False
+
+        cols_for_sql = ', '.join([f'"{col}"' for col in df_insert_columns]) # Asegurar comillas por si hay espacios o palabras reservadas
+        placeholders = ', '.join(['?' for _ in df_insert_columns])
+        sql_insert = f"INSERT OR IGNORE INTO ciudadanos ({cols_for_sql}) VALUES ({placeholders})"
+        
+        rows_to_insert = []
+        for index, row in df.iterrows():
+            # Asegurarse de que solo se pasan los valores de las columnas que están en df_insert_columns
+            # y en el orden correcto.
+            values_for_insert = []
+            for col_name in df_insert_columns:
+                value = row[col_name]
+                # Pandas puede leer celdas vacías como NaN, que SQLite puede no manejar bien directamente
+                # para todos los tipos. Convertir NaN a None.
+                if pd.isna(value):
+                    values_for_insert.append(None)
+                else:
+                    values_for_insert.append(value)
+            rows_to_insert.append(tuple(values_for_insert))
+
+        if rows_to_insert:
+            cursor.executemany(sql_insert, rows_to_insert)
+            conn.commit()
+            print(f"Datos de {excel_path} procesados. Se intentaron insertar {len(rows_to_insert)} filas.")
+            print(f"{cursor.rowcount} filas fueron afectadas (insertadas o ignoradas).")
+        else:
+            print("No hay filas para insertar después del procesamiento.")
+            
+        conn.close()
+        return True
+        
+    except FileNotFoundError:
+        print(f"Error: El archivo {excel_path} no fue encontrado.")
+        return False
+    except Exception as e:
+        print(f"Ocurrió un error al cargar datos desde Excel: {e}")
+        return False
+
+# Actualizamos el endpoint a /api/ciudadano/... para consistencia y lo protegemos.
+@app.route('/api/ciudadano/<string:ci>', methods=['GET'])
+@token_required
+def obtener_ciudadano_por_ci(current_user_data, ci):
+    """Obtiene los datos de un ciudadano por su número de CI. Protegido por token."""
+    # current_user_data es pasado por el decorador @token_required.
+    # Puede ser usado para logging, auditoría o lógica de autorización basada en roles en el futuro.
+    # Ejemplo de log (descomentar si se desea registrar la actividad):
+    # print(f"Usuario {current_user_data['ci_usuario']} (Rol: {current_user_data['role']}) consultó CI: {ci}")
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM ciudadanos WHERE ci = ?", (ci,))
+    ciudadano = cursor.fetchone()
+    conn.close()
+    
+    if ciudadano:
+        return jsonify(dict(ciudadano))
+    else:
+        return jsonify({"mensaje": "Ciudadano no encontrado"}), 404
+
+if __name__ == '__main__':
+    init_db() 
+    
+    # 5. Verificación Previa a la Carga
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(id) FROM ciudadanos")
+    count = cursor.fetchone()[0]
+    conn.close()
+
+    if count == 0:
+        print("La tabla 'ciudadanos' está vacía. Intentando cargar datos desde Excel...")
+        if cargar_datos_excel('padron.xlsx'): # Asegúrate que el nombre del archivo es correcto
+            print("Carga de datos desde Excel completada.")
+        else:
+            print("Fallo al cargar datos desde Excel o el archivo no está presente.")
+    else:
+        print(f"La tabla 'ciudadanos' ya contiene {count} registros. Se omite la carga inicial desde Excel.")
+
+    app.run(debug=True)
+
+@app.route('/api/auth/register', methods=['POST'])
+def register_user():
+    data = request.get_json()
+    if not data or not data.get('ci_usuario') or not data.get('password'):
+        return jsonify({"mensaje": "Faltan ci_usuario o password"}), 400
+
+    ci_usuario = data['ci_usuario']
+    password = data['password']
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Verificar si ci_usuario existe en el padrón (tabla ciudadanos)
+        cursor.execute("SELECT id FROM ciudadanos WHERE ci = ?", (ci_usuario,))
+        ciudadano = cursor.fetchone()
+        if not ciudadano:
+            return jsonify({"mensaje": "CI no encontrado en el padrón. No se puede registrar."}), 400
+
+        # Verificar si el usuario ya existe en usuarios_app
+        cursor.execute("SELECT id FROM usuarios_app WHERE ci_usuario = ?", (ci_usuario,))
+        existing_user = cursor.fetchone()
+        if existing_user:
+            return jsonify({"mensaje": "Usuario ya registrado"}), 400
+
+        # Crear nuevo usuario
+        hashed_password = generate_password_hash(password)
+        role = "usuario_consulta" # Rol por defecto
+        is_active = 1 # Activo por defecto
+
+        cursor.execute("""
+            INSERT INTO usuarios_app (ci_usuario, password_hash, role, is_active)
+            VALUES (?, ?, ?, ?)
+        """, (ci_usuario, hashed_password, role, is_active))
+        conn.commit()
+
+        return jsonify({"mensaje": "Usuario registrado exitosamente"}), 201
+
+    except sqlite3.Error as e:
+        # Loggear el error e: print(f"Database error: {e}")
+        return jsonify({"mensaje": f"Error en la base de datos: {e}"}), 500
+    except Exception as e:
+        # Loggear el error e: print(f"Unexpected error: {e}")
+        return jsonify({"mensaje": f"Un error inesperado ocurrió: {e}"}), 500
+    finally:
+        if conn:
+            conn.close()
+
+# Decorador para proteger rutas con JWT
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        auth_header = request.headers.get('Authorization')
+
+        if auth_header and auth_header.startswith('Bearer '):
+            token_value = auth_header.split(" ")[1]
+        else:
+            return jsonify({"mensaje": "Token es requerido en formato Bearer!"}), 401
+
+        if not token_value:
+            return jsonify({"mensaje": "Token es requerido!"}), 401
+
+        try:
+            data = jwt.decode(token_value, app.config['SECRET_KEY'], algorithms=[app.config['JWT_ALGORITHM']])
+            ci_usuario_from_token = data['sub'] # 'sub' es el ci_usuario
+            
+            conn_decorator = None
+            try:
+                conn_decorator = get_db_connection()
+                cursor_decorator = conn_decorator.cursor()
+                cursor_decorator.execute("SELECT * FROM usuarios_app WHERE ci_usuario = ? AND is_active = 1", (ci_usuario_from_token,))
+                current_user_row = cursor_decorator.fetchone()
+                if not current_user_row:
+                    return jsonify({"mensaje": "Usuario del token no encontrado o inactivo"}), 401
+                
+                # Pasar los datos relevantes del usuario al endpoint
+                # Convertimos sqlite3.Row a dict para facilitar el acceso en el endpoint
+                current_user_data = dict(current_user_row) 
+            except sqlite3.Error as e_db:
+                return jsonify({"mensaje": f"Error de base de datos al validar token: {e_db}"}), 500
+            finally:
+                if conn_decorator:
+                    conn_decorator.close()
+
+        except jwt.ExpiredSignatureError:
+            return jsonify({"mensaje": "Token ha expirado!"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"mensaje": "Token inválido!"}), 401
+        except Exception as e: # Captura otras posibles excepciones de jwt.decode o del acceso a 'sub'
+             return jsonify({"mensaje": f"Error al procesar token: {str(e)}"}), 401
+        
+        return f(current_user_data, *args, **kwargs)
+    return decorated
+
+@app.route('/api/auth/me', methods=['GET'])
+@token_required
+def get_current_user_info(current_user_data):
+    # current_user_data ya contiene la info de usuarios_app (ci_usuario, role, etc.)
+    ci_usuario = current_user_data['ci_usuario']
+    user_role = current_user_data['role']
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Consultar la tabla ciudadanos para obtener nombre, apellido, etc.
+        cursor.execute("SELECT nombre, apellido, direc, distrito, celular, fec_nac, edad FROM ciudadanos WHERE ci = ?", (ci_usuario,))
+        ciudadano_info_row = cursor.fetchone()
+
+        if not ciudadano_info_row:
+            # Esto sería inusual si el registro requiere un CI válido del padrón,
+            # pero es bueno manejarlo.
+            return jsonify({
+                "mensaje": "Información adicional del ciudadano no encontrada, pero el usuario es válido.",
+                "ci_usuario": ci_usuario,
+                "role": user_role
+            }), 200 # O 404 si se considera un error crítico
+
+        ciudadano_info = dict(ciudadano_info_row)
+
+        # Combinar información
+        user_details = {
+            "ci_usuario": ci_usuario,
+            "role": user_role,
+            "nombre": ciudadano_info.get('nombre'),
+            "apellido": ciudadano_info.get('apellido'),
+            "direccion": ciudadano_info.get('direc'),
+            "distrito": ciudadano_info.get('distrito'),
+            "celular": ciudadano_info.get('celular'),
+            "fecha_nacimiento": ciudadano_info.get('fec_nac'),
+            "edad": ciudadano_info.get('edad')
+            # Añadir más campos si es necesario
+        }
+        return jsonify(user_details), 200
+
+    except sqlite3.Error as e:
+        return jsonify({"mensaje": f"Error en la base de datos al obtener datos de ciudadano: {e}"}), 500
+    except Exception as e:
+        return jsonify({"mensaje": f"Un error inesperado ocurrió: {e}"}), 500
+    finally:
+        if conn:
+            conn.close()
+
+@app.route('/api/auth/login', methods=['POST'])
+def login_user():
+    data = request.get_json()
+    if not data or not data.get('ci_usuario') or not data.get('password'):
+        return jsonify({"mensaje": "Faltan ci_usuario o password"}), 400
+
+    ci_usuario = data['ci_usuario']
+    password = data['password']
+    
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT * FROM usuarios_app WHERE ci_usuario = ?", (ci_usuario,))
+        user_row = cursor.fetchone()
+
+        if not user_row:
+            return jsonify({"mensaje": "Credenciales inválidas o usuario inactivo"}), 401
+        
+        user = dict(user_row) # Convertir sqlite3.Row a dict para fácil acceso
+
+        if not user['is_active']:
+            return jsonify({"mensaje": "Credenciales inválidas o usuario inactivo"}), 401
+
+        if not check_password_hash(user['password_hash'], password):
+            return jsonify({"mensaje": "Credenciales inválidas o usuario inactivo"}), 401
+
+        # Generar token JWT
+        payload = {
+            'sub': user['ci_usuario'],
+            'role': user['role'],
+            'iat': datetime.datetime.utcnow(),
+            'exp': datetime.datetime.utcnow() + app.config['JWT_EXPIRATION_DELTA']
+        }
+        token = jwt.encode(payload, app.config['SECRET_KEY'], algorithm=app.config['JWT_ALGORITHM'])
+
+        return jsonify({"token": token}), 200
+
+    except sqlite3.Error as e:
+        return jsonify({"mensaje": f"Error en la base de datos: {e}"}), 500
+    except Exception as e:
+        return jsonify({"mensaje": f"Un error inesperado ocurrió: {e}"}), 500
+    finally:
+        if conn:
+            conn.close()
